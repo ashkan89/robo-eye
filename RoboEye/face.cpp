@@ -11,6 +11,10 @@ static inline int16_t clampi(int16_t v, int16_t lo, int16_t hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 static inline float ease01(float p) { return p * p * (3.0f - 2.0f * p); }
+// NaN-safe: the comparisons fail for NaN, so it comes out as `lo`
+static inline float clampf(float v, float lo, float hi) {
+  return (v > lo) ? (v < hi ? v : hi) : lo;
+}
 
 // quarter sine, 0..90 deg in 16 steps, scaled to 0..127
 static const int8_t SIN16[17] PROGMEM = {
@@ -36,6 +40,9 @@ static const uint8_t SCFG[NSPRING * 2] PROGMEM = {
 static const int8_t SPX[3] PROGMEM = { 12, 116, 64 };    // sparkle anchors
 static const int8_t SPY[3] PROGMEM = {  9,  11,  5 };
 
+// longest step the spring solver will take in one go; see Face::update
+#define SUB_DT          0.025f
+
 #define BLINK_CLOSE_MS  55.0f
 #define BLINK_OPEN_MS  115.0f
 
@@ -54,6 +61,9 @@ void Face::begin() {
   speedPct = 100;
   emo      = EMO_NEUTRAL;
   facePre  = FACE_FULL;
+  panel    = OLED_PANEL;
+  bandFx   = SPLIT_FX_IN_BAND;
+  recomputeRegions();
   blinkOpen[0] = blinkOpen[1] = 1.0f;
   blinkState = 0; blinkEye = 0; demoIdx = 255;
   microX = microY = breath = 0.0f;
@@ -73,24 +83,82 @@ void Face::begin() {
   tTalk = tTalkStep = tDemo = 0;
 }
 
+// ----------------------------------------------------------- regions
+// A two-colour module is one mono panel with yellow phosphor over its top
+// PANEL_SPLIT_ROWS rows and a dead seam below them.  Keeping the face
+// inside the rows underneath is the whole of the "support": the driver is
+// untouched, only the geometry moves.
+void Face::recomputeRegions() {
+  const bool sp = (panel == PANEL_SPLIT);
+  faceY0 = sp ? (PANEL_SPLIT_ROWS + PANEL_SPLIT_GAP) : 0;
+  faceY1 = OLED_H - 1;
+
+  // The floating effects either own the yellow strip - they are accents,
+  // and yellow accents over a blue face read as deliberate - or share the
+  // face's region.  On a mono panel they keep the top of the screen,
+  // exactly as before.
+  if (sp && bandFx) { fxY0 = 0;      fxH = PANEL_SPLIT_ROWS - PANEL_SPLIT_GAP; }
+  else              { fxY0 = faceY0; fxH = 32; }
+}
+
+void Face::setPanel(uint8_t p) {
+  panel = (p == PANEL_SPLIT) ? PANEL_SPLIT : PANEL_MONO;
+  recomputeRegions();
+  recomputeLayout();
+  applyPreset(true);           // snap: morphing across a relayout is noise
+}
+
+void Face::setFxInBand(bool b) {
+  bandFx = b;
+  recomputeRegions();
+}
+
 // ------------------------------------------------------------ layout
+// Budget the region's height instead of hard-coding rows, so one set of
+// rules gives the old 64-row layout on a mono panel and a correctly
+// proportioned one inside the 48 blue rows of a split panel.
 void Face::recomputeLayout() {
-  bool m = features & F_MOUTH;
-  bool b = features & F_BROWS;
-  bool n = features & F_NOSE;
+  const bool m = features & F_MOUTH;
+  const bool b = features & F_BROWS;
+  const bool n = features & F_NOSE;
 
-  if (m && b)      { baseW = 38; baseH = 28; eyeCY = 27; }
-  else if (m)      { baseW = 40; baseH = 32; eyeCY = 24; }
-  else if (b)      { baseW = 42; baseH = 38; eyeCY = 36; }
-  else             { baseW = 44; baseH = 42; eyeCY = 32; }
+  const int16_t H = faceY1 - faceY0 + 1;
 
-  int8_t gap = n ? 26 : 20;
+  // Everything vertical is expressed as a fraction of a full 64-row panel
+  // and then scaled, so a face squeezed into 48 blue rows keeps its
+  // proportions instead of growing a mouth that dwarfs the eyes.  vs16 is
+  // that scale in 1/256ths, and it is exactly 256 on a mono panel - which
+  // is why the numbers below are the ones the layout was tuned with.
+  vs16   = (uint16_t)((uint32_t)H * 256u / 64u);
+  browT  = (int8_t)(((int16_t)4 * vs16) >> 8);   // brow bar thickness
+  if (browT < 2) browT = 2;
+  browGap = (int8_t)(((int16_t)7 * vs16) >> 8);  // brow baseline above the eye
+  if (browGap < browT + 1) browGap = browT + 1;
+
+  const int16_t top = b ? (int16_t)(((int32_t)9 * vs16) >> 8) : 2;
+  const int16_t mouthBand = m ? (int16_t)(((int32_t)20 * vs16) >> 8) : 3;
+  const int16_t bot = H - mouthBand;       // last row before the mouth
+  int16_t avail = bot - top + 1;
+  if (avail < 10) avail = 10;
+
+  // `surprised` inflates the eye to 126% of baseH, so sizing baseH at 72%
+  // of the space leaves even the biggest eye room to grow into.
+  baseH = (int8_t)((avail * 72) / 100);
+  if (baseH < 6) baseH = 6;
+  eyeCY = (int8_t)(faceY0 + top + avail / 2);
+
+  baseW = (int8_t)(baseH + 12);            // squarer as the eye gets taller
+  if (baseW > 44) baseW = 44;              // two eyes plus the gap must fit
+
+  const int8_t gap = n ? 26 : 20;
   eyeCX[0] = 64 - (baseW + gap) / 2;
   eyeCX[1] = 64 + (baseW + gap) / 2;
 
-  mouthCY = 53;
-  browY0  = eyeCY - baseH / 2 - 7;
-  noseCY  = n ? (m ? 43 : (int8_t)(eyeCY + baseH / 2 + 8)) : 0;
+  mouthCY = (int8_t)(faceY1 - mouthBand / 2);
+  browY0  = eyeCY - baseH / 2 - browGap;
+  noseCY  = n ? (m ? (int8_t)((eyeCY + baseH / 2 + mouthCY) / 2)
+                   : (int8_t)(eyeCY + baseH / 2 + 8))
+              : 0;
 }
 
 void Face::setFeatures(uint8_t f) {
@@ -193,6 +261,14 @@ void Face::update(float dt) {
   const uint32_t now = millis();
   const float sp = speedPct * 0.01f;
 
+  // Clamp here rather than trusting the caller.  The solver below is
+  // stable for any dt it is actually given, but only because the substep
+  // count is bounded - hand it a whole second and the substeps get long
+  // enough to ring again.  0.05 s is two substeps, which is stable even
+  // at `speed 250`.  The test also rejects a NaN or a negative dt.
+  if (!(dt > 0.0f)) dt = 0.001f;
+  if (dt > 0.05f)   dt = 0.05f;
+
   // ---- demo reel -------------------------------------------------
   if (demoIdx < NUM_EMO && now >= tDemo) {
     setEmotion(demoIdx++, false);
@@ -250,12 +326,42 @@ void Face::update(float dt) {
   }
 
   // ---- solve every spring ----------------------------------------
+  //
+  // The obvious integration - `vel += (f*f*err - 2*z*f*vel) * dt` - is only
+  // conditionally stable.  Its damping term alone multiplies the velocity
+  // by (1 - 2*z*f*dt) each step, so once 2*z*f*dt passes 2 the sign flips
+  // AND the magnitude grows: the value doubles, redoubles, reaches the
+  // float range in a second or so and then goes to inf, at which point
+  // `tgt - v` is NaN and STAYS NaN.  Nothing recovers from that - a new
+  // emotion only writes `tgt` - so the feature is stuck drawing garbage
+  // for the rest of the run.  The mouth-open spring is the stiffest at
+  // f = 18 rad/s, which put the old code over the limit at `speed 250`
+  // (f is scaled by the speed) or at any frame slower than ~55 ms.
+  //
+  // Two changes make it unconditionally stable:
+  //   - the damping is resolved implicitly, as a divide, which can only
+  //     ever shrink the velocity whatever dt is;
+  //   - the step is subdivided so the remaining explicit term never sees
+  //     more than SUB_DT at a time.
+  // The range check afterwards is the last line of defence: a value that
+  // still leaves its sane range is snapped to its target, so even an
+  // unforeseen route to inf costs one frame instead of the whole session.
+  uint8_t steps = 1;
+  while (steps < 4 && dt > SUB_DT * steps) steps++;
+  const float h = dt / steps;
+
   for (uint8_t i = 0; i < NSPRING; i++) {
     Spring &s = S[i];
-    float f = (float)pgm_read_byte(&SCFG[i * 2]) * sp;
-    float z = (float)pgm_read_byte(&SCFG[i * 2 + 1]) * 0.01f;
-    s.vel += (f * f * (s.tgt - s.v) - 2.0f * z * f * s.vel) * dt;
-    s.v   += s.vel * dt;
+    const float f = (float)pgm_read_byte(&SCFG[i * 2]) * sp;
+    const float z = (float)pgm_read_byte(&SCFG[i * 2 + 1]) * 0.01f;
+    const float damp = 1.0f / (1.0f + 2.0f * z * f * h);
+    for (uint8_t k = 0; k < steps; k++) {
+      s.vel = (s.vel + f * f * (s.tgt - s.v) * h) * damp;
+      s.v  += s.vel * h;
+    }
+    // written as a failed positive test so that a NaN also trips it
+    if (!(s.v > -4000.0f && s.v < 4000.0f)) { s.v = s.tgt; s.vel = 0.0f; }
+    if (!(s.vel > -100000.0f && s.vel < 100000.0f)) s.vel = 0.0f;
   }
 }
 
@@ -288,9 +394,10 @@ void Face::drawAll() {
   if (features & F_FX)    drawFx();
 
   if (features & F_SCAN) {                 // CRT scan band (XOR)
-    int16_t y = (int16_t)phase(3000, 0) * 62 >> 8;      // stays on-panel
+    const int16_t regH = faceY1 - faceY0 + 1;
+    int16_t y = faceY0 + ((int16_t)phase(3000, 0) * (regH - 2) >> 8);
     u.setDrawColor(2);
-    u.drawBox(0, y, 128, 2);
+    u.drawBox(0, y, OLED_W, 2);
     u.setDrawColor(1);
   }
 }
@@ -306,18 +413,26 @@ void Face::drawEye(uint8_t i) {
   int16_t cx = eyeCX[i] + iround(gxf * 0.10f + microX);
   int16_t cy = eyeCY    + iround(gyf * 0.06f + microY + breath) + tilt;
 
+  // Bound the eye by the layout, not just by the panel.  The widest
+  // preset is 126% of the base size and a spring overshoots by a few
+  // percent on top, so 150% is generous; letting it reach the full 128
+  // columns would, on the heart-eye emotions, draw a heart the size of
+  // the screen.
+  const int16_t regH = faceY1 - faceY0 + 1;
   int16_t w = iround(S[S_EW + i].v);
   int16_t h = iround(S[S_EH + i].v * blinkOpen[i]);
   if (w < 6) w = 6;
   if (h < 2) h = 2;
-  if (w > 120) w = 120;
-  if (h > 62) h = 62;
+  if (w > baseW + baseW / 2) w = baseW + baseW / 2;
+  if (h > baseH + baseH / 2) h = baseH + baseH / 2;
+  if (w > OLED_W - 8) w = OLED_W - 8;
+  if (h > regH - 2)   h = regH - 2;
 
-  // Keep the whole eye on the panel.  A rect that hangs off the edge also
-  // means an off-panel clip window for the glints, and a big gaze bias
-  // plus a `look -100 0` can push it there.
-  cx = clampi(cx, w / 2, (int16_t)(127 - (w - 1 - w / 2)));
-  cy = clampi(cy, h / 2, (int16_t)(63 - (h - 1 - h / 2)));
+  // Keep the whole eye inside the face region.  A rect that hangs off the
+  // edge also means an off-region clip window for the glints, and a big
+  // gaze bias plus a `look -100 0` can push it there.
+  cx = clampi(cx, w / 2, (int16_t)(OLED_W - 1 - (w - 1 - w / 2)));
+  cy = clampi(cy, faceY0 + h / 2, (int16_t)(faceY1 - (h - 1 - h / 2)));
 
   int16_t x0 = cx - w / 2, y0 = cy - h / 2;
   int16_t x1 = x0 + w - 1, y1 = y0 + h - 1;
@@ -335,20 +450,30 @@ void Face::drawEye(uint8_t i) {
   else       u.drawRBox(x0, y0, w, h, r);
 
   // ---- iris / specular glints ------------------------------------
-  // Gate these on how much of the eye the lids actually leave showing,
-  // not on its full height: a glint punched through a nearly shut eye
-  // erases the thin band that is the whole expression.
-  float opening = 1.0f - S[S_LIDT + i].v - S[S_LIDB + i].v;
-  int16_t vis = (opening > 0.0f) ? (int16_t)(h * opening) : 0;
+  // Everything here is positioned against the band the lids actually
+  // leave open, never against the full eye box.  A glint placed at a
+  // fixed fraction of the box - which is what this used to do - lands on
+  // top of the lid the moment an emotion closes one: the black disc then
+  // merges with the black lid and eats a bite out of the eye's edge,
+  // leaving a stray disconnected sliver in the corner.  That was the
+  // "proud is glitched" report, and sad, focused and skeptical had it too.
+  const float lt = S[S_LIDT + i].v, lb = S[S_LIDB + i].v;
+  const int16_t vy0 = y0 + (lt > 0.0f ? (int16_t)(h * lt) : 0);  // first open row
+  const int16_t vy1 = y1 - (lb > 0.0f ? (int16_t)(h * lb) : 0);  // last open row
+  const int16_t vis = vy1 - vy0 + 1;
+  const int16_t vcy = (vy0 + vy1) / 2;
 
   if ((cur.flags & FL_SPIRAL_EYES) && vis > 12) {
-    drawSpiral(cx, cy, mn / 2 - 2);
+    int16_t sr = mn / 2 - 2;
+    if (sr > vis / 2 - 1) sr = vis / 2 - 1;
+    drawSpiral(cx, vcy, sr);
   } else if (style == STYLE_PUPIL && vis > 12) {
     int16_t pr = mn / 4;
+    if (pr > (vis - 2) / 2) pr = (vis - 2) / 2;
     if (pr < 2) pr = 2;
     int16_t px = cx + iround(gxf * 0.004f * w);
-    int16_t py = cy + iround(gyf * 0.004f * h);
-    u.setClipWindow(x0, y0, x1 + 1, y1 + 1);
+    int16_t py = vcy + iround(gyf * 0.004f * vis);
+    u.setClipWindow(x0, vy0, x1 + 1, vy1 + 1);
     u.setDrawColor(0);
     u.drawDisc(px, py, pr);
     u.setDrawColor(1);
@@ -356,18 +481,27 @@ void Face::drawEye(uint8_t i) {
     if (gr < 1) u.drawPixel(px - pr / 2, py - pr / 2);
     else        u.drawDisc(px - pr / 2, py - pr / 2, gr);
     u.setMaxClipWindow();
-  } else if ((features & F_GLINT) && vis > 11 && w > 12) {
+  } else if ((features & F_GLINT) && vis >= 16 && w > 12) {
+    // Two highlights, both sized and placed so that at least one lit row
+    // is left between them and either lid.  Below 16 open rows there is
+    // no room for that and the eye is better off plain.
     int16_t g1 = clampi(w / 8, 2, 6);
-    u.setClipWindow(x0, y0, x1 + 1, y1 + 1);
-    u.setDrawColor(0);
-    u.drawDisc(x0 + w / 4, y0 + h / 4, g1);
-    u.drawDisc(x0 + (w * 2) / 3, y0 + (h * 5) / 8, g1 / 2 > 0 ? g1 / 2 : 1);
-    u.setMaxClipWindow();
-    u.setDrawColor(1);
+    int16_t gy = vy0 + vis / 3;
+    if (g1 > gy - vy0 - 1) g1 = gy - vy0 - 1;
+    int16_t g2 = g1 / 2 > 0 ? g1 / 2 : 1;
+    int16_t hy = vy0 + (vis * 2) / 3;
+    if (g2 > vy1 - hy - 1) g2 = vy1 - hy - 1;
+    if (g1 >= 2) {
+      u.setClipWindow(x0, vy0, x1 + 1, vy1 + 1);
+      u.setDrawColor(0);
+      u.drawDisc(x0 + w / 4, gy, g1);
+      if (g2 >= 1) u.drawDisc(x0 + (w * 2) / 3, hy, g2);
+      u.setMaxClipWindow();
+      u.setDrawColor(1);
+    }
   }
 
   // ---- eyelids ---------------------------------------------------
-  const float lt = S[S_LIDT + i].v, lb = S[S_LIDB + i].v;
   u.setDrawColor(0);   // lids are cut out of the eye, so draw them black
   if (lt > 0.01f)
     drawLid(i, x0, y0, x1, y1, lt, S[S_LIDTS + i].v, true,
@@ -420,17 +554,21 @@ void Face::drawBrows() {
     int16_t w  = iround(S[S_EW + i].v * 0.98f);
     int16_t cx = eyeCX[i] + iround(gxf * 0.05f + microX * 0.5f);
     int16_t y  = browY0 + iround(S[S_BROWY].v + breath * 0.6f);
-    if ((cur.flags & FL_BROW_ASYM) && i == 1) y -= 5;
+    if ((cur.flags & FL_BROW_ASYM) && i == 1) y -= (5 * vs16) >> 8;
 
     if (w < 2) w = 2;
-    int16_t d  = iround(S[S_BROWAL + i].v * 0.085f);
+    int16_t d  = iround(S[S_BROWAL + i].v * 0.085f * vs16 * (1.0f / 256.0f));
     int16_t ad = d < 0 ? -d : d;
-    y = clampi(y, 1 + ad, 40);                 // keep the tilt on the panel
-    int16_t xl = clampi(cx - w / 2, 0, (int16_t)(127 - w));
+    // keep the whole tilted bar inside the face region, above the eye
+    int16_t yLo = faceY0 + 1 + ad;
+    int16_t yHi = eyeCY - baseH / 2 - 1 - ad;
+    if (yHi < yLo) yHi = yLo;
+    y = clampi(y, yLo, yHi);
+    int16_t xl = clampi(cx - w / 2, 0, (int16_t)(OLED_W - 1 - w));
     int16_t yL = (i == 0) ? (y - d) : (y + d);
     int16_t yR = (i == 0) ? (y + d) : (y - d);
     for (int16_t k = 0; k <= w; k++)
-      u.drawVLine(xl + k, yL + (int16_t)(((int32_t)(yR - yL) * k) / w), 4);
+      u.drawVLine(xl + k, yL + (int16_t)(((int32_t)(yR - yL) * k) / w), browT);
   }
 }
 
@@ -444,12 +582,15 @@ void Face::drawNose() {
 // Two parabolic lips filled column by column: one shape covers smiles,
 // frowns, open grins and the surprised "O".
 void Face::drawMouth() {
-  int16_t mw  = clampi(iround(0.48f * S[S_MOUTHW].v), 12, 74);
+  // S_MOUTHW/C/O are spring outputs; clamp before they reach the fixed
+  // point maths so one wild frame cannot scale into a screen-wide bar
+  int16_t mw  = clampi(iround(0.48f * clampf(S[S_MOUTHW].v, 0.0f, 200.0f)), 12, 74);
   int16_t x0  = 64 - mw / 2;
   int16_t cyb = mouthCY + iround(breath * 0.4f);
 
-  const int32_t curveQ = (int32_t)(S[S_MOUTHC].v * 0.085f * 256.0f);  // px << 8
-  const int32_t openQ  = (int32_t)(S[S_MOUTHO].v * 0.190f * 256.0f);  // px << 8
+  // *vs16 rather than *256 folds the region scale into the fixed point
+  const int32_t curveQ = (int32_t)(clampf(S[S_MOUTHC].v, -150.0f, 150.0f) * 0.085f * vs16);
+  const int32_t openQ  = (int32_t)(clampf(S[S_MOUTHO].v,    0.0f, 150.0f) * 0.190f * vs16);
 
   for (int16_t x = x0; x <= x0 + mw; x++) {
     int32_t uq   = ((int32_t)(x - x0) * 512) / mw - 256;
@@ -458,16 +599,21 @@ void Face::drawMouth() {
     // middle drops, so a big grin cannot walk off the bottom of the panel
     int32_t ymid = ((int32_t)cyb << 8) + ((curveQ * p) >> 8) - (curveQ >> 1);
     int32_t half = (openQ * p) >> 9;
-    int16_t yt = clampi((int16_t)((ymid - half) >> 8), 0, 63);
-    int16_t yb = clampi((int16_t)((ymid + half) >> 8), 0, 63);
+    int16_t yt = clampi((int16_t)((ymid - half) >> 8), faceY0, faceY1);
+    int16_t yb = clampi((int16_t)((ymid + half) >> 8), faceY0, faceY1);
     if (yb < yt + 1) yb = yt + 1;
     u.drawVLine(x, yt, yb - yt + 1);
   }
 }
 
 // -------------------------------------------------------------- blush
+// Cheek hatching, parked in whatever gap the layout leaves between the
+// bottom of the eye and the top of the mouth.
 void Face::drawBlush() {
-  int16_t y = eyeCY + baseH / 2 + 5;
+  const int16_t eyeBot = eyeCY + baseH / 2;
+  const int16_t lo = eyeBot + 4, hi = faceY1 - 4;
+  int16_t y = (features & F_MOUTH) ? (eyeBot + mouthCY) / 2 : eyeBot + 5;
+  y = clampi(y, lo < hi ? lo : hi, hi);
   uint8_t n = (S[S_BLUSH].v > 55.0f) ? 3 : 2;
   for (uint8_t i = 0; i < 2; i++) {
     int16_t cx = eyeCX[i] + (i ? 6 : -6);
@@ -565,32 +711,42 @@ void Face::drawQmark(int16_t x, int16_t y) {
 }
 
 // ------------------------------------------------------------ effects
+// The floating effects live in their own strip - fxY0 .. fxY0+fxH-1 - so
+// that on a two-colour panel they can be handed the 16 yellow rows while
+// the face keeps the blue ones.  Every offset below is written as a
+// fraction of fxH, and fxH is 32 on a mono panel, which is the geometry
+// these were originally hand-placed against.  The two effects anchored to
+// the face itself, tears and the sweat drop, follow the face instead.
 void Face::drawFx() {
+  const int16_t fy1 = fxY0 + fxH - 1;
+
   switch (cur.fx) {
 
     case FX_ZZZ:
       for (uint8_t k = 0; k < 3; k++) {
         uint8_t ph = phase(2000, k * 87);
-        int16_t y  = 26 - ((int16_t)ph * 22 >> 8);
+        int16_t y  = fxY0 + (fxH * 13 / 16) - ((int16_t)ph * (fxH * 11 / 16) >> 8);
         int16_t x  = 100 + (isin(ph >> 2) >> 5) + k * 5;
-        if (y > 2) drawZ(x, y, 4 + k * 2);
+        int16_t s  = 4 + k * 2;
+        if (y > fxY0 + 1 && y + s <= fy1) drawZ(x, y, s);
       }
       break;
 
     case FX_QUESTION: {
-      int16_t y = 4 + (isin(phase(900, 0) >> 2) >> 6);
+      int16_t y = fxY0 + 2 + (isin(phase(900, 0) >> 2) >> 6);
       drawQmark(108, y);
-      drawQmark(99, y + 8);
+      drawQmark(99, clampi(y + fxH / 4, fxY0, (int16_t)(fy1 - 8)));
     } break;
 
-    case FX_SWEAT:
-      drawDrop(114, 12 + ((int16_t)phase(1200, 0) * 28 >> 8), 3);
+    case FX_SWEAT:                       // hangs beside the brow: face-anchored
+      drawDrop(114, clampi(faceY0 + 12 + ((int16_t)phase(1200, 0) * 28 >> 8),
+                           faceY0 + 4, faceY1 - 1), 3);
       break;
 
-    case FX_TEAR:
+    case FX_TEAR:                        // runs down the cheek: face-anchored
       for (uint8_t k = 0; k < 2; k++) {
         int16_t y = eyeCY + baseH / 2 + ((int16_t)phase(1700, k * 128) * 20 >> 8);
-        if (y < 62) drawDrop(eyeCX[k] + (k ? 8 : -8), y, 2);
+        if (y < faceY1 - 1) drawDrop(eyeCX[k] + (k ? 8 : -8), y, 2);
       }
       break;
 
@@ -598,26 +754,30 @@ void Face::drawFx() {
       for (uint8_t k = 0; k < 3; k++) {
         uint8_t ph = phase(900, k * 95);
         uint8_t a  = (ph < 128) ? ph : (uint8_t)(255 - ph);
-        drawStar((int8_t)pgm_read_byte(&SPX[k]),
-                 (int8_t)pgm_read_byte(&SPY[k]), (int16_t)a * 11 >> 7);
+        int16_t y  = fxY0 + (int16_t)pgm_read_byte(&SPY[k]) * fxH / 32 + 1;
+        int16_t r  = (int16_t)a * 11 >> 7;
+        int16_t rm = y - fxY0 < fy1 - y ? y - fxY0 : fy1 - y;   // fit the strip
+        if (r > rm) r = rm;
+        if (r > 0) drawStar((int8_t)pgm_read_byte(&SPX[k]), y, r);
       }
       break;
 
     case FX_STEAM:
       for (uint8_t k = 0; k < 2; k++) {
         uint8_t ph = phase(1100, k * 128);
-        int16_t y  = 15 - ((int16_t)ph * 13 >> 8);
+        int16_t y  = fxY0 + fxH / 2 - 1 - ((int16_t)ph * (fxH * 13 / 32) >> 8);
         int16_t r  = 2 + ((int16_t)ph * 3 >> 8);
-        if (y - r > 0) { drawRing(7 + k * 3, y, r); drawRing(121 - k * 3, y, r); }
+        if (y - r >= fxY0) { drawRing(7 + k * 3, y, r); drawRing(121 - k * 3, y, r); }
       }
       break;
 
     case FX_HEART:
       for (uint8_t k = 0; k < 2; k++) {
         uint8_t ph = phase(1800, k * 128);
-        int16_t y  = 30 - ((int16_t)ph * 26 >> 8);
+        int16_t y  = fy1 - 1 - ((int16_t)ph * (fxH * 26 / 32) >> 8);
         int16_t x  = 112 + (isin(ph >> 2) >> 5);
-        if (y > 5) { int16_t s = 5 + ((int16_t)ph * 4 >> 8); drawHeart(x, y, s, s); }
+        int16_t s  = 5 + ((int16_t)ph * 4 >> 8);
+        if (y - s / 2 > fxY0) drawHeart(x, y, s, s);
       }
       break;
 
@@ -629,9 +789,10 @@ void Face::drawFx() {
 //  Boot animation - CRT power-on, then the eyes wake up and say hi.
 // ===================================================================
 void Face::boot() {
+  const int16_t midY = (faceY0 + faceY1) / 2;      // centre of the face region
   for (int16_t w = 2; w <= 104; w += 8) {          // hairline stretches out
     u.first();
-    do { u.drawBox(64 - w / 2, 31, w, 2); } while (u.next());
+    do { u.drawBox(64 - w / 2, midY, w, 2); } while (u.next());
   }
   for (uint8_t s = 0; s <= 10; s++) {              // splits into two eyes
     float p = ease01(s / 10.0f);
@@ -642,7 +803,7 @@ void Face::boot() {
     do {
       for (uint8_t i = 0; i < 2; i++) {
         int16_t cx = 64 + (int16_t)((eyeCX[i] - 64) * p);
-        int16_t cy = 31 + (int16_t)((eyeCY - 31) * p);
+        int16_t cy = midY + (int16_t)((eyeCY - midY) * p);
         if (r < 1) u.drawBox(cx - w / 2, cy - h / 2, w, h);
         else       u.drawRBox(cx - w / 2, cy - h / 2, w, h, r);
       }

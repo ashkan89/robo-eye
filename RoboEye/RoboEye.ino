@@ -37,7 +37,7 @@ static uint8_t cmdLen;
 //  EEPROM
 // =====================================================================
 #if ENABLE_EEPROM
-#define EE_MAGIC 0xE7
+#define EE_MAGIC 0xE8         // bumped: the layout gained two bytes
 static void saveCfg() {
   EEPROM.update(0, EE_MAGIC);
   EEPROM.update(1, face.featureMask());
@@ -46,9 +46,15 @@ static void saveCfg() {
   EEPROM.update(4, face.autoOn() ? 1 : 0);
   EEPROM.update(5, face.speed());
   EEPROM.update(6, face.facePreset());
+  EEPROM.update(7, face.panelId());
+  EEPROM.update(8, face.fxInBand() ? 1 : 0);
 }
 static bool loadCfg() {
   if (EEPROM.read(0) != EE_MAGIC) return false;
+  // panel first: it re-lays the whole face out, so anything set before it
+  // would only be recomputed from the wrong region
+  face.setFxInBand(EEPROM.read(8));
+  face.setPanel(EEPROM.read(7));
   face.setFeatures(EEPROM.read(1));
   face.setStyle(EEPROM.read(2));
   face.setEmotion(EEPROM.read(3), true);
@@ -96,6 +102,8 @@ static void showHelp() {
   Serial.println(F("auto on|off  autonomous mood  info        status + fps"));
   Serial.println(F("face 0..4    eyes/brows/mouth/full/full+nose"));
   Serial.println(F("style robot|pupil"));
+  Serial.println(F("panel mono|split  1-colour / 2-colour (yellow top 16px)"));
+  Serial.println(F("band on|off  put the effects in the yellow strip"));
   Serial.println(F("mouth|brows|nose|blush|glint|scan|tilt|fx  on|off"));
   Serial.println(F("look <x> <y> gaze -100..100    blink       blink now"));
   Serial.println(F("wink l|r     one eye          talk <ms>   mouth chatter"));
@@ -109,6 +117,8 @@ static void printInfo() {
   printEmoName(face.emotion());
   Serial.print(F(" face=")); Serial.print(face.facePreset());
   Serial.print(F(" style=")); Serial.print(face.styleId());
+  Serial.print(F(" panel=")); Serial.print(face.panelId() ? F("split") : F("mono"));
+  Serial.print(F(" band=")); Serial.print(face.fxInBand());
   Serial.print(F(" auto=")); Serial.print(face.autoOn());
   Serial.print(F(" spd=")); Serial.print(face.speed());
   Serial.print(F(" mask=0x")); Serial.print(face.featureMask(), HEX);
@@ -217,6 +227,18 @@ static void runCommand(char *line) {
     Serial.println(F("ok"));
     return;
   }
+  if (!strcasecmp(w, "panel") && a1) {
+    face.setPanel(!strcasecmp(a1, "split") ? PANEL_SPLIT : PANEL_MONO);
+    Serial.println(face.panelId() ? F("split - face in the blue rows")
+                                  : F("mono - face over all 64 rows"));
+    return;
+  }
+  if (!strcasecmp(w, "band") && a1) {
+    face.setFxInBand(!strcasecmp(a1, "on"));
+    Serial.println(face.fxInBand() ? F("effects in the yellow strip")
+                                   : F("effects with the face"));
+    return;
+  }
   if (!strcasecmp(w, "look") && a1 && a2) {
     face.setAuto(false);
     face.look(constrain(atoi(a1), -100, 100), constrain(atoi(a2), -100, 100), 4000);
@@ -250,7 +272,14 @@ static void pollSerial() {
     if (c == '\r') continue;
     if (c == '\n') {
       cmd[cmdLen] = 0;
-      if (cmdLen) runCommand(cmd);
+      if (cmdLen) {
+        runCommand(cmd);
+        // A command can block for a long time - `test` runs for 2.7 s, and
+        // printing the help text fills the 64-byte TX buffer several times
+        // over at 115200.  Restarting the frame clock here means that time
+        // is never handed to the animation as one enormous dt.
+        tPrev = micros();
+      }
       cmdLen = 0;
     } else if (cmdLen < sizeof(cmd) - 1) {
       cmd[cmdLen++] = c;
@@ -335,7 +364,9 @@ void setup() {
 #if USE_HW_SPI
   Serial.print(F("bus=SPI sck=13 mosi=11 cs=")); Serial.print(OLED_CS);
   Serial.print(F(" dc=")); Serial.print(OLED_DC);
-  Serial.print(F(" rst=")); Serial.println(OLED_RST);
+  Serial.print(F(" rst=")); Serial.print(OLED_RST);
+  Serial.print(F(" clk=")); Serial.print(SPI_CLOCK / 1000000UL);
+  Serial.println(F("MHz"));
 #else
   Serial.println(F("bus=I2C sda=A4 scl=A5"));
 #endif
@@ -390,12 +421,17 @@ void loop() {
 
   float dt = (now - tPrev) * 1e-6f;
   tPrev = now;
-  if (dt > 0.08f) dt = 0.08f;      // never let a stall fast-forward the face
+  // Never let a stall fast-forward the face.  The spring solver is stable
+  // at any dt now, but a single huge step still snaps every feature to its
+  // target in one frame, which reads as a jolt.
+  if (dt > 0.05f) dt = 0.05f;
 
   if (!frozen) face.update(dt);
   face.render();
 
   frames++;
-  if (millis() - tFps >= 1000) { fps = frames; frames = 0; tFps += 1000; }
+  // `= millis()`, not `+= 1000`: after a long stall the latter spends the
+  // next few seconds catching up and reporting nonsense rates
+  if (millis() - tFps >= 1000) { fps = frames; frames = 0; tFps = millis(); }
 
 }

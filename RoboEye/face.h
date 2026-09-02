@@ -66,6 +66,14 @@ public:
   void setStyle(uint8_t s) { style = s; }
   uint8_t styleId() const { return style; }
 
+  // PANEL_MONO or PANEL_SPLIT - see config.h.  Changing it re-lays the
+  // whole face out, so the eyes, brows and mouth land inside the blue
+  // rows of a two-colour module instead of straddling the seam.
+  void setPanel(uint8_t p);
+  uint8_t panelId() const { return panel; }
+  void setFxInBand(bool b);
+  bool fxInBand() const { return bandFx; }
+
   void setAuto(bool a) { autoMode = a; }
   bool autoOn() const { return autoMode; }
 
@@ -83,12 +91,19 @@ private:
   Oled &u;
   EmoPreset cur;
 
-  uint8_t emo, features, style, speedPct, facePre;
-  bool    autoMode;
+  uint8_t emo, features, style, speedPct, facePre, panel;
+  bool    autoMode, bandFx;
 
-  // layout (recomputed whenever the feature set changes)
+  // Screen regions, recomputed by setPanel().  Everything the face draws
+  // is expressed against these rather than against the panel edges, so
+  // one code path serves a mono panel and the 48 blue rows of a split one.
+  int8_t faceY0, faceY1;      // rows the face itself may use, inclusive
+  int8_t fxY0, fxH;           // rows the floating effects may use
+
+  // layout (recomputed whenever the feature set or the region changes)
+  uint16_t vs16;              // region height / 64, in 1/256ths
   int8_t eyeCX[2];
-  int8_t eyeCY, baseW, baseH, mouthCY, browY0, noseCY;
+  int8_t eyeCY, baseW, baseH, mouthCY, browY0, noseCY, browT, browGap;
 
   // animated state
   Spring S[NSPRING];
@@ -108,6 +123,7 @@ private:
   // out-of-line on purpose: 32-bit modulo + divide, called from a dozen
   // places, so one copy is far cheaper in flash than a dozen inlined ones
   __attribute__((noinline)) uint8_t phase(uint16_t per, uint8_t offset) const;
+  void recomputeRegions();
   void recomputeLayout();
   void applyPreset(bool instant);
 

@@ -61,10 +61,62 @@ below instead.
 | DC | D9 | `OLED_DC` |
 | CS | D10 | `OLED_CS` |
 
-Bus clock is `SPI_CLOCK`, 4 MHz by default — already about 10x I2C at 400 kHz, and
-tolerant of breadboards and dupont jumpers. 8000000UL is the ceiling on a 16 MHz AVR
-and worth trying if your leads are short and tidy; if the picture speckles or tears,
-come back down. 2000000UL is the setting to reach for on long or messy wiring.
+#### Bus clock
+
+`SPI_CLOCK` is **4 MHz** by default. Three numbers decide that:
+
+* The [SSD1306 datasheet](https://www.buydisplay.com/download/ic/SSD1306.pdf) gives a
+  minimum serial clock cycle of **100 ns** for the 4-wire SPI interface — a 10 MHz
+  ceiling.
+* [Adafruit_SSD1306](https://github.com/adafruit/Adafruit_SSD1306) ships **8 MHz** as
+  its default for every board, i.e. that spec with some headroom.
+* The ATmega328P's SPI unit can only *divide* the system clock, so on a 16 MHz Nano or
+  Pro Mini 5V the only rates near the top are `F_CPU/2` = **8 MHz** and `F_CPU/4` =
+  **4 MHz**. Nothing lands in between — ask for 6 MHz and you get 4.
+
+So the real choice is 8 or 4. 8 MHz is inside spec and fine on a PCB or short leads,
+but the SCK edges are then ~60 ns apart and the 20–30 cm dupont jumpers these modules
+are usually wired with ring badly — which shows up as speckled or torn pixels, not as
+a clean failure. **4 MHz is the safe value for jumper-wired builds** and is still
+about 10x I2C, so it is what ships.
+
+Raise it to `8000000UL` only with short, tidy leads (a 22R series resistor in the SCK
+line helps too). `config.h` clamps anything above `F_CPU/2` back down, which also
+keeps a 3.3 V / 8 MHz Pro Mini at its own 4 MHz ceiling. On long or messy wiring drop
+to `2000000UL`. The boot banner prints the rate actually in use.
+
+### Two-colour panels (yellow top strip)
+
+The cheap "two colour" 0.96" modules are **not** two panels. They are one ordinary
+mono SSD1306 whose top 16 rows carry yellow phosphor and whose remaining 48 carry
+blue, with a masked dead band between them. The controller cannot address the colours
+and no driver setting changes anything — but a face laid out over all 64 rows gets
+sliced in two by that seam, with the brows and the top of the eyes stranded in yellow.
+
+`config.h` picks the geometry:
+
+```c
+#define OLED_PANEL       PANEL_SPLIT   // or PANEL_MONO for a one-colour panel
+#define PANEL_SPLIT_ROWS 16            // yellow rows at the top
+#define PANEL_SPLIT_GAP   2            // rows the mask on the glass swallows
+#define SPLIT_FX_IN_BAND  1            // float the effects in the yellow strip
+```
+
+On `PANEL_SPLIT` the whole face — eyes, brows, mouth, blush, nose — is laid out inside
+the blue rows and keeps its proportions there; nothing straddles the seam. With
+`SPLIT_FX_IN_BAND 1` the floating effects (sparkles, ZZZ, hearts, steam, question
+marks) are given the yellow strip, so it reads as a deliberate accent instead of dead
+space. The two effects that belong to the face itself, tears and the sweat drop, stay
+with it. Set it to `0` to leave the strip dark.
+
+Both are switchable at run time, so one build drives either module:
+
+```
+panel mono      face over all 64 rows
+panel split     face in the blue rows
+band on|off     effects in the yellow strip
+save            remember it
+```
 
 ### I2C (`USE_HW_SPI 0`)
 
@@ -92,12 +144,11 @@ Then, in order of likelihood:
 
 1. **`USE_HW_SPI` doesn't match your wiring.** The single most common cause.
 2. **Only 4 pins on the module.** That board is I2C-only; use `USE_HW_SPI 0`.
-3. **RST.** If your board has no RES pin, set `OLED_RST` to `U8X8_PIN_NONE`. If it
-   does have one, it must be connected — left floating, the panel often never
-   initialises.
+3. **RST.** If your board has no RES pin, set `OLED_RST` to `-1`. If it does have
+   one, it must be connected — left floating, the panel often never initialises.
 4. **Wrong controller.** The sketch drives an SSD1306. A 1.3" panel is almost always
-   an SH1106 — swap the constructor at the top of `RoboEye.ino` for
-   `U8G2_SH1106_128X64_NONAME_2_4W_HW_SPI`, same arguments.
+   an SH1106, which needs a different init sequence and a column offset; this driver
+   will not drive it as-is.
 5. **Some modules ship jumpered for I2C.** Look for solder blobs marked BS0-BS2 or
    R1/R3/R8 on the back; SPI needs them in the SPI position.
 6. **D13 is also the Pro Mini's LED pin.** Its LED plus resistor can load SCK enough
@@ -136,6 +187,27 @@ The pointer is therefore rebuilt from scratch on each write and cannot stay lost
 and every band ships with its own `0x22`/`0x21` pair, so the addressing is
 re-established several times per frame. Dropping the library also removed about
 5.5 KB of flash and 700 bytes of RAM.
+
+**Two software faults that used to look electrical** — both fixed, both worth knowing
+about because of how they presented:
+
+* *The face slowly falls apart and never recovers, most obviously the mouth, which
+  stays wrong even when you change emotion.* The spring solver integrated explicitly,
+  which is only stable while `2 * zeta * f * dt < 2`. The mouth-opening spring is the
+  stiffest at `f = 18 rad/s`, so `speed 235`+ at a normal frame, or **any** frame
+  slower than about 55 ms at the default speed, put it past that limit. Past it the
+  value grows every frame until it overflows to infinity, after which `target - value`
+  is NaN **for ever** — and since a new emotion only writes the *target*, nothing
+  could ever pull it back. The solver now resolves the damping implicitly and
+  subdivides the step, so it is stable at any `dt`, and clamps anything that still
+  leaves a sane range back onto its target.
+* *One emotion's eyes look chewed — a bite missing from a corner, or a stray
+  disconnected sliver.* The specular glints were positioned at a fixed fraction of the
+  eye's **box**. As soon as an emotion closed a lid, the black glint disc landed under
+  it, merged with the black lid, and ate a notch out of the eye's outline. It hit
+  every half-lidded emotion — proud, sad, focused, skeptical, angry, love. Glints are
+  now placed and sized inside the band the lids actually leave open, with a lit row
+  guaranteed either side, and are skipped entirely below 16 open rows.
 
 **Also check you are not looking at features.** The face
 draws marks that can read as glitches if you are not expecting them: the blush is two
@@ -183,6 +255,8 @@ Type `help` for the list. Commands are case-insensitive.
 | `auto on` / `auto off` | autonomous mood drift (a new mood every 7-16 s) |
 | `face 0..4` | eyes only / +brows / +mouth / full / full+nose |
 | `style robot` / `style pupil` | solid Vector-style eye, or a moving iris |
+| `panel mono` / `panel split` | one-colour panel, or two-colour with a 16 px yellow top |
+| `band on` / `band off` | put the floating effects in the yellow strip |
 | `mouth\|brows\|nose\|blush\|glint\|scan\|tilt\|fx  on\|off` | toggle one feature |
 | `look <x> <y>` | aim the gaze, -100..100 on each axis |
 | `blink`, `wink l`, `wink r` | one-shot |
@@ -271,7 +345,11 @@ Everything worth changing is in `config.h`:
 | Define | Meaning |
 |---|---|
 | `USE_HW_SPI` | 1 = 4-wire hardware SPI (default), 0 = I2C |
-| `SPI_CLOCK` | 8000000 — the maximum a 16 MHz AVR can clock out |
+| `SPI_CLOCK` | 4000000 — the safe rate for jumper wiring; 8000000 is the AVR's ceiling |
+| `OLED_PANEL` | `PANEL_MONO` or `PANEL_SPLIT` (two-colour, yellow top strip) |
+| `PANEL_SPLIT_ROWS` | 16 — yellow rows at the top of a two-colour module |
+| `PANEL_SPLIT_GAP` | 2 — rows around the colour seam that nothing is drawn into |
+| `SPLIT_FX_IN_BAND` | 1 — float the effects in the yellow strip |
 | `STARTUP_SELFTEST` | draw the 3 s test pattern before the face |
 | `OLED_BANDS` | 2 — buffer bands; 1 uses a full 1 KB buffer, needs a roomier board |
 | `TARGET_FPS` | 40 — redraw cap, lower it if you see torn bands |
